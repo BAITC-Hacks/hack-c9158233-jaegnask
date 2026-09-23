@@ -6,6 +6,7 @@
 """
 
 import argparse
+import html
 import itertools
 from pathlib import Path
 
@@ -655,6 +656,101 @@ def build_cluster_summary(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataF
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS["clusters"])
 
 
+def write_html_report(
+    features: pd.DataFrame,
+    graph: nx.DiGraph,
+    clusters: pd.DataFrame,
+    ordered: pd.DataFrame,
+    out_dir: Path,
+) -> None:
+    """Создаёт самодостаточный статический отчёт для локального просмотра."""
+    def esc(value: object) -> str:
+        return html.escape(str(value))
+
+    def kzt(value: float) -> str:
+        return f"{float(value):,.0f}".replace(",", " ") + " KZT"
+
+    role_rows = "".join(
+        f"<tr><td>{esc(role)}</td><td>{int(count)}</td><td>{count / len(features):.1%}</td></tr>"
+        for role, count in features.role.value_counts().items()
+    )
+    pattern_names = {
+        "fan-in": "Fan-in",
+        "fan-out": "Fan-out",
+        "rapid transit": "Rapid pass-through",
+        "split payments": "Split payments",
+        "circular flow": "Circular flow",
+        "money island": "Isolated money island",
+    }
+    patterns = features.patterns.fillna("")
+    pattern_rows = "".join(
+        f"<tr><td>{label}</td><td>{int(patterns.str.contains(code, regex=False).sum())}</td></tr>"
+        for code, label in pattern_names.items()
+    )
+    top_rows = "".join(
+        "<tr>"
+        f"<td>{rank}</td><td>{esc(row.gid)}</td><td>{esc(row.role)}</td>"
+        f"<td>{row.priority_score:.3f}</td><td>{int(row.cluster_id)}</td>"
+        f"<td>{esc(row.evidence)}</td>"
+        "</tr>"
+        for rank, (_, row) in enumerate(ordered.head(20).iterrows(), start=1)
+    )
+    top_clusters = clusters.sort_values(
+        ["sum_kzt_internal", "n_nodes"], ascending=[False, False]
+    ).head(10)
+    cluster_rows = "".join(
+        "<tr>"
+        f"<td>{int(row.cluster_id)}</td><td>{int(row.n_nodes)}</td><td>{int(row.n_seed)}</td>"
+        f"<td>{kzt(row.sum_kzt_internal)}</td><td>{esc(row.hypothesis)}</td>"
+        "</tr>"
+        for row in top_clusters.itertuples(index=False)
+    )
+
+    top = ordered.iloc[0]
+    largest = clusters.loc[clusters.n_nodes.idxmax()]
+    flagged = int(patterns.ne("").sum())
+    depth_limited = int(features.truncated_by_depth.sum())
+    page = f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AML Graph Analysis — отчёт</title>
+<style>
+body{{font-family:Arial,sans-serif;max-width:1280px;margin:32px auto;padding:0 18px;color:#172033;background:#f7f9fc}}
+h1,h2{{color:#12243d}} h1{{margin-bottom:4px}} .muted{{color:#5e6b7a}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:20px 0}}
+.card{{background:#fff;border:1px solid #dce3ec;border-radius:9px;padding:16px}} .value{{font-size:25px;font-weight:700;color:#075985}}
+section{{background:#fff;border:1px solid #dce3ec;border-radius:9px;padding:18px;margin:16px 0;overflow:auto}}
+table{{border-collapse:collapse;width:100%;font-size:14px}} th,td{{padding:9px;border-bottom:1px solid #e6ebf1;text-align:left;vertical-align:top}}
+th{{background:#eef5fb;white-space:nowrap}} tr:hover{{background:#f8fbff}} ul{{line-height:1.55}} .note{{background:#fff8db;padding:12px;border-radius:6px}}
+</style></head><body>
+<h1>AML Graph Analysis</h1><p class="muted">Статический отчёт, созданный командой <code>python3 solution.py --data data --out out</code>.</p>
+<div class="cards">
+<div class="card"><div class="muted">Узлов</div><div class="value">{len(features)}</div></div>
+<div class="card"><div class="muted">Направленных рёбер</div><div class="value">{graph.number_of_edges()}</div></div>
+<div class="card"><div class="muted">Кластеров</div><div class="value">{len(clusters)}</div></div>
+<div class="card"><div class="muted">Seed-узлов</div><div class="value">{int(features.is_seed.sum())}</div></div>
+<div class="card"><div class="muted">Узлов с AML-паттерном</div><div class="value">{flagged}</div></div>
+</div>
+<section><h2>Распределение ролей</h2><table><tr><th>Роль</th><th>Узлов</th><th>Доля</th></tr>{role_rows}</table></section>
+<section><h2>Распределение AML-паттернов</h2><p class="muted">Один узел может иметь несколько паттернов; это сигналы для проверки, а не доказательство нарушения.</p><table><tr><th>Паттерн</th><th>Узлов</th></tr>{pattern_rows}</table></section>
+<section><h2>Top-20 приоритетных узлов</h2><table><tr><th>#</th><th>gid</th><th>Роль</th><th>Priority</th><th>Кластер</th><th>Объяснение</th></tr>{top_rows}</table></section>
+<section><h2>Top-10 кластеров по внутреннему обороту</h2><table><tr><th>Кластер</th><th>Узлов</th><th>Seed</th><th>Внутренний оборот</th><th>Гипотеза</th></tr>{cluster_rows}</table></section>
+<section><h2>Интересные факты</h2><ul>
+<li>Наивысший приоритет: gid <strong>{esc(top.gid)}</strong>, роль <strong>{esc(top.role)}</strong>, score <strong>{top.priority_score:.3f}</strong>.</li>
+<li>Крупнейший кластер: #{int(largest.cluster_id)} — {int(largest.n_nodes)} узлов, внутренний оборот {kzt(largest.sum_kzt_internal)}.</li>
+<li>{flagged} узлов отмечены хотя бы одним AML-паттерном.</li>
+<li>{depth_limited} узлов находятся на depth=4: у них граф обрезан, поэтому terminal нельзя подтверждать только отсутствием исходящих рёбер.</li>
+</ul></section>
+<section><h2>Рекомендации аналитика</h2><ol>
+<li>Начать с Top-20: сверить KYC, назначение платежей и контрагентов по узлам с высоким priority.</li>
+<li>В первую очередь проверить сочетания нескольких AML-паттернов с высокой транзитностью или крупным оборотом.</li>
+<li>Проверять кластеры как единый денежный контур, а не изолированно каждый перевод.</li>
+<li class="note">Ограничение: выгрузка ограничена четырьмя хопами; отсутствие продолжения платежей на depth=4 не является доказательством terminal.</li>
+</ol></section>
+</body></html>"""
+    (out_dir / "report.html").write_text(page, encoding="utf-8")
+
+
 def write_outputs(features: pd.DataFrame, graph: nx.DiGraph, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     nodes_roles = features[OUTPUT_COLUMNS["nodes_roles"]].copy()
@@ -674,6 +770,7 @@ def write_outputs(features: pd.DataFrame, graph: nx.DiGraph, out_dir: Path) -> N
         "why": top_nodes.evidence,
     })
     top_nodes.to_csv(out_dir / "top_nodes.csv", index=False)
+    write_html_report(features, graph, clusters, ordered, out_dir)
 
 
 def main() -> None:
