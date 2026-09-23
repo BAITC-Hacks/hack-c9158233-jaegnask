@@ -84,20 +84,82 @@ def basic_metrics(graph: nx.DiGraph, nodes: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def assign_mvp_roles(metrics: pd.DataFrame) -> pd.DataFrame:
-    """Простые, временные эвристики MVP; они будут заменены на следующем этапе."""
+def role_thresholds(metrics: pd.DataFrame) -> dict[str, float]:
+    """Пороги ролей из текущей выгрузки, а не вручную заданные константы."""
+    outgoing = metrics.loc[metrics.out_deg > 0]
+    return {
+        # Сборщик: верхние 5% по числу входящих контрагентов и переводов.
+        "high_in_deg": float(metrics.in_deg.quantile(0.95)),
+        "high_in_tx": float(metrics.in_tx.quantile(0.95)),
+        # Распределитель: верхние 10% среди фактически отправляющих узлов.
+        "high_out_deg": float(outgoing.out_deg.quantile(0.90)),
+        "high_out_tx": float(outgoing.out_tx.quantile(0.90)),
+        "high_out_kzt": float(outgoing.out_kzt.quantile(0.90)),
+        "seed_out_deg": float(outgoing.out_deg.quantile(0.75)),
+        "seed_out_tx": float(outgoing.out_tx.quantile(0.75)),
+    }
+
+
+def assign_roles(metrics: pd.DataFrame) -> pd.DataFrame:
+    """Прозрачные правила ролей на степенях, оборотах и количестве переводов."""
     result = metrics.copy()
     # Для узла без входящих средств отношение не определено; в сдаваемой CSV
     # используем 0, чтобы не оставлять обязательное поле пустым.
     result["pass_through"] = result.pass_through.fillna(0.0)
+    thresholds = role_thresholds(result)
     result["role"] = "peripheral"
-    result.loc[(result.out_deg == 0) & ~result.truncated_by_depth, "role"] = "terminal"
-    result.loc[(result.in_deg > 0) & (result.out_deg > 0), "role"] = "transit"
-    result.loc[(result.in_deg == 0) & (result.out_deg > 0), "role"] = "distributor"
-    result.loc[result.is_seed & (result.out_deg > 0), "role"] = "coordinator"
-    result["role_score"] = np.select(
-        [result.role.eq("peripheral"), result.role.eq("terminal")], [0.50, 0.60], default=0.55
+
+    # Глубина 4 означает обрезанную выгрузку, поэтому эти узлы всегда остаются
+    # peripheral до отдельного анализа: terminal им присваивать нельзя.
+    eligible = ~result.truncated_by_depth
+    consolidator = (
+        eligible
+        & (result.in_deg >= thresholds["high_in_deg"])
+        & (result.in_tx >= thresholds["high_in_tx"])
+        & ((result.out_deg <= 1) | (result.pass_through <= 0.50))
     )
+    distributor = (
+        eligible
+        & (result.out_deg >= thresholds["high_out_deg"])
+        & (result.out_tx >= thresholds["high_out_tx"])
+        & (result.out_kzt >= thresholds["high_out_kzt"])
+    )
+    coordinator = (
+        eligible
+        & result.is_seed
+        & (result.out_deg >= thresholds["seed_out_deg"])
+        & (result.out_tx >= thresholds["seed_out_tx"])
+    )
+    transit = (
+        eligible
+        & (result.in_deg > 0)
+        & (result.out_deg > 0)
+        & result.pass_through.between(0.60, 1.50)
+    )
+    terminal = eligible & (result.in_deg > 0) & (result.out_deg == 0)
+
+    # Приоритет правил: широкое распределение > seed-координатор > сборщик >
+    # транзит > конечный получатель. Так у каждого gid ровно одна роль.
+    result.loc[terminal, "role"] = "terminal"
+    result.loc[transit, "role"] = "transit"
+    result.loc[consolidator, "role"] = "consolidator"
+    result.loc[coordinator, "role"] = "coordinator"
+    result.loc[distributor, "role"] = "distributor"
+
+    result["role_score"] = 0.50
+    result.loc[result.role.eq("terminal"), "role_score"] = 0.75
+    result.loc[result.role.eq("transit"), "role_score"] = (
+        0.60 + 0.30 * (1 - (result.loc[result.role.eq("transit"), "pass_through"] - 1).abs())
+    ).clip(0.60, 0.90)
+    result.loc[result.role.eq("consolidator"), "role_score"] = (
+        0.65 + 0.10 * (result.loc[result.role.eq("consolidator"), "in_deg"] / thresholds["high_in_deg"] - 1)
+    ).clip(0.65, 0.95)
+    result.loc[result.role.eq("coordinator"), "role_score"] = (
+        0.65 + 0.10 * (result.loc[result.role.eq("coordinator"), "out_deg"] / thresholds["seed_out_deg"] - 1)
+    ).clip(0.65, 0.95)
+    result.loc[result.role.eq("distributor"), "role_score"] = (
+        0.65 + 0.10 * (result.loc[result.role.eq("distributor"), "out_deg"] / thresholds["high_out_deg"] - 1)
+    ).clip(0.65, 0.95)
 
     # Один технический кластер на MVP: это гарантирует согласованность двух выгрузок.
     result["cluster_id"] = 0
@@ -108,13 +170,25 @@ def assign_mvp_roles(metrics: pd.DataFrame) -> pd.DataFrame:
     )
     result["priority_score"] = result.priority_score.fillna(0.0).clip(0.0, 1.0)
     result["pagerank"] = 0.0  # Поле схемы; вычисление PageRank намеренно отложено.
-    result["evidence"] = result.apply(
-        lambda row: (
-            f"in_deg={row.in_deg}, out_deg={row.out_deg}, "
-            f"in_kzt={row.in_kzt:.0f}, out_kzt={row.out_kzt:.0f}, depth={row.depth}"
-        ),
-        axis=1,
-    )
+    def evidence(row: pd.Series) -> str:
+        if row.role == "consolidator":
+            return (f"in_deg={row.in_deg}, in_tx={row.in_tx}, in_kzt={row.in_kzt:.0f}, "
+                    f"out_deg={row.out_deg}, pass_through={row.pass_through:.2f}")
+        if row.role == "distributor":
+            return (f"out_deg={row.out_deg}, out_tx={row.out_tx}, out_kzt={row.out_kzt:.0f}, "
+                    f"in_deg={row.in_deg}")
+        if row.role == "coordinator":
+            return (f"is_seed=1, out_deg={row.out_deg}, out_tx={row.out_tx}, "
+                    f"out_kzt={row.out_kzt:.0f}")
+        if row.role == "transit":
+            return (f"in_kzt={row.in_kzt:.0f}, out_kzt={row.out_kzt:.0f}, "
+                    f"pass_through={row.pass_through:.2f}, in_tx={row.in_tx}, out_tx={row.out_tx}")
+        if row.role == "terminal":
+            return f"in_kzt={row.in_kzt:.0f}, in_tx={row.in_tx}, out_deg=0, depth={row.depth}"
+        return (f"in_deg={row.in_deg}, out_deg={row.out_deg}, depth={row.depth}, "
+                f"truncated_by_depth={int(row.truncated_by_depth)}")
+
+    result["evidence"] = result.apply(evidence, axis=1)
     return result
 
 
@@ -155,11 +229,11 @@ def main() -> None:
 
     edges, nodes, transactions = load_data(args.data)
     graph = build_graph(edges)
-    features = assign_mvp_roles(basic_metrics(graph, nodes))
+    features = assign_roles(basic_metrics(graph, nodes))
     write_outputs(features, args.out)
     print(f"Загружено: {len(nodes)} узлов, {len(edges)} рёбер, {len(transactions)} транзакций")
     print(f"Граф: {graph.number_of_nodes()} узлов, {graph.number_of_edges()} рёбер")
-    print(f"MVP-выгрузки записаны в: {args.out}")
+    print(f"Выгрузки записаны в: {args.out}")
 
 
 if __name__ == "__main__":
