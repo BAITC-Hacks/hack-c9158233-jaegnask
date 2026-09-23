@@ -459,10 +459,14 @@ def human_evidence(row: pd.Series) -> str:
     """Формирует короткое объяснение роли и приоритета для AML-аналитика."""
     turnover = format_kzt(row.in_kzt + row.out_kzt)
     priority = (
-        f"Приоритет {row.priority_score:.2f}: оборот {turnover}, "
+        f"Triage {row.priority_score:.2f}: оборот {turnover}, "
         f"PageRank {row.pagerank:.6f}, кластер {int(row._cluster_n_nodes)} уз."
     )
-    pattern_note = f" AML-паттерны: {row.patterns}." if row.patterns else ""
+    safe_patterns = (
+        row.patterns.replace("rapid transit", "временная близость IN/OUT")
+        .replace("circular flow", "структурный цикл")
+    )
+    pattern_note = f" AML-сигналы: {safe_patterns}." if safe_patterns else ""
 
     if row.truncated_by_depth:
         return (
@@ -472,7 +476,7 @@ def human_evidence(row: pd.Series) -> str:
     if row.role == "transit":
         text = (
             f"Транзит: получил {format_kzt(row.in_kzt)}, отправил {format_kzt(row.out_kzt)}; "
-            f"{row.pass_through * 100:.0f}% прошло дальше."
+            f"исходящий оборот — {row.pass_through * 100:.0f}% наблюдаемого входящего."
         )
         if row.betweenness_score >= 0.20:
             text += f" Посредничество {row.betweenness_score:.2f}."
@@ -513,20 +517,20 @@ def human_evidence(row: pd.Series) -> str:
         return evidence
     # Компактный вариант сохраняет роль, числа, все AML-паттерны и приоритет.
     compact_patterns = (
-        row.patterns.replace("rapid transit", "rapid")
+        row.patterns.replace("rapid transit", "IN/OUT близко")
         .replace("split payments", "split")
-        .replace("circular flow", "cycle")
+        .replace("circular flow", "структ. цикл")
         .replace("money island", "island")
     )
     if row.truncated_by_depth:
         return (
             f"Depth=4: граф обрезан, terminal не подтверждён. AML: {compact_patterns}. "
-            f"Приоритет {row.priority_score:.2f}, кластер {int(row._cluster_n_nodes)} уз."
+            f"Triage {row.priority_score:.2f}, кластер {int(row._cluster_n_nodes)} уз."
         )
     if row.role == "transit":
         compact_role = (
-            f"Транзит: вход {format_kzt(row.in_kzt)}, выход {format_kzt(row.out_kzt)}, "
-            f"{row.pass_through * 100:.0f}% дальше."
+            f"Транзит: вход {format_kzt(row.in_kzt)}, выход {format_kzt(row.out_kzt)}; "
+            f"отношение {row.pass_through * 100:.0f}% к наблюдаемому входу."
         )
     elif row.role == "consolidator":
         compact_role = f"Сборщик: вход {format_kzt(row.in_kzt)} от {int(row.in_deg)} контрагентов."
@@ -535,7 +539,7 @@ def human_evidence(row: pd.Series) -> str:
     else:
         compact_role = f"{row.role}: вход {format_kzt(row.in_kzt)}, выход {format_kzt(row.out_kzt)}."
     return (
-        f"{compact_role} AML: {compact_patterns}. Приоритет {row.priority_score:.2f}: "
+        f"{compact_role} AML: {compact_patterns}. Triage {row.priority_score:.2f}: "
         f"PR {row.pagerank:.6f}, кластер {int(row._cluster_n_nodes)} уз."
     )
 
@@ -656,7 +660,7 @@ def build_cluster_summary(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataF
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS["clusters"])
 
 
-def write_largest_cluster_svg(
+def write_largest_cluster_html(
     features: pd.DataFrame, graph: nx.DiGraph, clusters: pd.DataFrame, out_dir: Path
 ) -> None:
     """Рисует компактную локальную карту крупнейшего кластера без новых зависимостей."""
@@ -704,7 +708,7 @@ def write_largest_cluster_svg(
 </head><body><h1>Карта крупнейшего кластера #{largest_id}</h1><p class="muted">{len(cluster)} узлов, {subgraph.number_of_edges()} внутренних направленных рёбер. Цвет — роль, размер — priority score. Подписи даны только 15 наиболее приоритетным узлам; наведите курсор на узел для деталей.</p>
 <p class="legend">{legend}</p><svg viewBox="0 0 {width} {height}" role="img" aria-label="Карта крупнейшего кластера"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker></defs>{edges}{''.join(nodes)}</svg>
 </body></html>'''
-    (out_dir / "largest_cluster.svg").write_text(svg, encoding="utf-8")
+    (out_dir / "largest_cluster.html").write_text(svg, encoding="utf-8")
 
 
 def write_html_report(
@@ -712,6 +716,7 @@ def write_html_report(
     graph: nx.DiGraph,
     clusters: pd.DataFrame,
     ordered: pd.DataFrame,
+    transactions: pd.DataFrame,
     out_dir: Path,
 ) -> None:
     """Создаёт самодостаточный статический отчёт для локального просмотра."""
@@ -728,9 +733,9 @@ def write_html_report(
     pattern_names = {
         "fan-in": "Fan-in",
         "fan-out": "Fan-out",
-        "rapid transit": "Rapid pass-through",
+        "rapid transit": "Rapid transit — временная близость входящих и исходящих операций",
         "split payments": "Split payments",
-        "circular flow": "Circular flow",
+        "circular flow": "Circular flow — структурный цикл",
         "money island": "Isolated money island",
     }
     patterns = features.patterns.fillna("")
@@ -746,6 +751,29 @@ def write_html_report(
         "</tr>"
         for rank, (_, row) in enumerate(ordered.head(20).iterrows(), start=1)
     )
+    operation_sections = []
+    for rank, (_, node) in enumerate(ordered.head(20).iterrows(), start=1):
+        gid = node.gid
+        operations = transactions.loc[
+            transactions.src.eq(gid) | transactions.dst.eq(gid),
+            ["date", "src", "dst", "sum_kzt"],
+        ].sort_values(["date", "src", "dst"], kind="stable")
+        rows = "".join(
+            "<tr>"
+            f"<td>{operation.date.strftime('%Y-%m-%d')}</td>"
+            f"<td>{esc(operation.src)}</td><td>{esc(operation.dst)}</td>"
+            f"<td>{'IN' if operation.dst == gid else 'OUT'}</td>"
+            f"<td>{kzt(operation.sum_kzt)}</td>"
+            "</tr>"
+            for operation in operations.itertuples(index=False)
+        )
+        operation_sections.append(
+            f"<details><summary>#{rank} · gid {esc(gid)} · {esc(node.role)} · "
+            f"triage {node.priority_score:.3f} · операций {len(operations)}</summary>"
+            "<table><tr><th>date</th><th>src</th><th>dst</th><th>direction</th><th>sum_kzt</th></tr>"
+            f"{rows}</table></details>"
+        )
+    operations_html = "".join(operation_sections)
     top_clusters = clusters.sort_values(
         ["sum_kzt_internal", "n_nodes"], ascending=[False, False]
     ).head(10)
@@ -772,7 +800,7 @@ h1,h2{{color:#12243d}} h1{{margin-bottom:4px}} .muted{{color:#5e6b7a}}
 .card{{background:#fff;border:1px solid #dce3ec;border-radius:9px;padding:16px}} .value{{font-size:25px;font-weight:700;color:#075985}}
 section{{background:#fff;border:1px solid #dce3ec;border-radius:9px;padding:18px;margin:16px 0;overflow:auto}}
 table{{border-collapse:collapse;width:100%;font-size:14px}} th,td{{padding:9px;border-bottom:1px solid #e6ebf1;text-align:left;vertical-align:top}}
-th{{background:#eef5fb;white-space:nowrap}} tr:hover{{background:#f8fbff}} ul{{line-height:1.55}} .note{{background:#fff8db;padding:12px;border-radius:6px}}
+th{{background:#eef5fb;white-space:nowrap}} tr:hover{{background:#f8fbff}} ul{{line-height:1.55}} .note{{background:#fff8db;padding:12px;border-radius:6px}} details{{margin:9px 0;border:1px solid #e6ebf1;border-radius:6px;padding:10px}} summary{{cursor:pointer;font-weight:700;color:#075985}}
 </style></head><body>
 <h1>AML Graph Analysis</h1><p class="muted">Статический отчёт, созданный командой <code>python3 solution.py --data data --out out</code>.</p>
 <div class="cards">
@@ -783,12 +811,13 @@ th{{background:#eef5fb;white-space:nowrap}} tr:hover{{background:#f8fbff}} ul{{l
 <div class="card"><div class="muted">Узлов с AML-паттерном</div><div class="value">{flagged}</div></div>
 </div>
 <section><h2>Распределение ролей</h2><table><tr><th>Роль</th><th>Узлов</th><th>Доля</th></tr>{role_rows}</table></section>
-<section><h2>Распределение AML-паттернов</h2><p class="muted">Один узел может иметь несколько паттернов; это сигналы для проверки, а не доказательство нарушения.</p><table><tr><th>Паттерн</th><th>Узлов</th></tr>{pattern_rows}</table></section>
-<section><h2>Top-20 приоритетных узлов</h2><table><tr><th>#</th><th>gid</th><th>Роль</th><th>Priority</th><th>Кластер</th><th>Объяснение</th></tr>{top_rows}</table></section>
+<section><h2>Распределение AML-паттернов</h2><p class="muted">Один узел может иметь несколько паттернов; это сигналы для проверки, а не доказательство нарушения. Rapid transit означает только временную близость входящих и исходящих операций; circular flow — только структурный цикл.</p><table><tr><th>Паттерн</th><th>Узлов</th></tr>{pattern_rows}</table></section>
+<section><h2>Top-20 узлов для triage</h2><p class="muted">Priority score задаёт порядок ручной проверки, а не вероятность риска или нарушения.</p><table><tr><th>#</th><th>gid</th><th>Роль</th><th>Priority</th><th>Кластер</th><th>Объяснение</th></tr>{top_rows}</table></section>
+<section><h2>Наблюдаемые операции Top-20</h2><p class="note">Данные имеют дневную точность; порядок операций внутри дня неизвестен.</p><p class="muted">IN и OUT указаны относительно проверяемого gid. Таблицы отсортированы по дате.</p>{operations_html}</section>
 <section><h2>Top-10 кластеров по внутреннему обороту</h2><table><tr><th>Кластер</th><th>Узлов</th><th>Seed</th><th>Внутренний оборот</th><th>Гипотеза</th></tr>{cluster_rows}</table></section>
-<section><h2>Карта крупнейшего кластера</h2><p>Цветом показана роль, размером — priority score, стрелкой — направление перевода. <a href="largest_cluster.svg">Открыть локальную SVG-карту кластера #{int(largest.cluster_id)}</a>.</p></section>
+<section><h2>Карта крупнейшего кластера</h2><p>Цветом показана роль, размером — triage priority score, стрелкой — направление перевода. <a href="largest_cluster.html">Открыть локальную карту кластера #{int(largest.cluster_id)}</a>.</p></section>
 <section><h2>Интересные факты</h2><ul>
-<li>Наивысший приоритет: gid <strong>{esc(top.gid)}</strong>, роль <strong>{esc(top.role)}</strong>, score <strong>{top.priority_score:.3f}</strong>.</li>
+<li>Первый в triage-очереди: gid <strong>{esc(top.gid)}</strong>, роль <strong>{esc(top.role)}</strong>, priority score <strong>{top.priority_score:.3f}</strong>.</li>
 <li>Крупнейший кластер: #{int(largest.cluster_id)} — {int(largest.n_nodes)} узлов, внутренний оборот {kzt(largest.sum_kzt_internal)}.</li>
 <li>{flagged} узлов отмечены хотя бы одним AML-паттерном.</li>
 <li>{depth_limited} узлов находятся на depth=4: у них граф обрезан, поэтому terminal нельзя подтверждать только отсутствием исходящих рёбер.</li>
@@ -803,7 +832,9 @@ th{{background:#eef5fb;white-space:nowrap}} tr:hover{{background:#f8fbff}} ul{{l
     (out_dir / "report.html").write_text(page, encoding="utf-8")
 
 
-def write_outputs(features: pd.DataFrame, graph: nx.DiGraph, out_dir: Path) -> None:
+def write_outputs(
+    features: pd.DataFrame, graph: nx.DiGraph, transactions: pd.DataFrame, out_dir: Path
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     nodes_roles = features[OUTPUT_COLUMNS["nodes_roles"]].copy()
     nodes_roles.to_csv(out_dir / "nodes_roles.csv", index=False)
@@ -822,8 +853,8 @@ def write_outputs(features: pd.DataFrame, graph: nx.DiGraph, out_dir: Path) -> N
         "why": top_nodes.evidence,
     })
     top_nodes.to_csv(out_dir / "top_nodes.csv", index=False)
-    write_largest_cluster_svg(features, graph, clusters, out_dir)
-    write_html_report(features, graph, clusters, ordered, out_dir)
+    write_largest_cluster_html(features, graph, clusters, out_dir)
+    write_html_report(features, graph, clusters, ordered, transactions, out_dir)
 
 
 def main() -> None:
@@ -841,7 +872,7 @@ def main() -> None:
     features = features.merge(suspicious_patterns(graph, transactions, features), on="gid", how="left")
     features = add_graph_role_support(features)
     features = add_priority_scores(graph, features)
-    write_outputs(features, graph, args.out)
+    write_outputs(features, graph, transactions, args.out)
     print(f"Загружено: {len(nodes)} узлов, {len(edges)} рёбер, {len(transactions)} транзакций")
     print(f"Граф: {graph.number_of_nodes()} узлов, {graph.number_of_edges()} рёбер")
     print(f"Выгрузки записаны в: {args.out}")
