@@ -84,6 +84,55 @@ def basic_metrics(graph: nx.DiGraph, nodes: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def weighted_pagerank(
+    graph: nx.DiGraph, alpha: float = 0.85, tolerance: float = 1e-10, max_iter: int = 200
+) -> dict:
+    """Взвешенный PageRank без дополнительной зависимости scipy.
+
+    Вес ``sum_kzt`` определяет долю влияния, передаваемую по исходящим рёбрам.
+    Узлы без рёбер не входят в граф и получают PageRank 0 при объединении с nodes.
+    """
+    gids = list(graph.nodes)
+    n_nodes = len(gids)
+    if n_nodes == 0:
+        return {}
+
+    index = {gid: index for index, gid in enumerate(gids)}
+    scores = np.full(n_nodes, 1.0 / n_nodes)
+    outgoing = []
+    dangling = []
+    for gid in gids:
+        edges = list(graph.out_edges(gid, data="sum_kzt"))
+        total_weight = sum(float(weight) for _, _, weight in edges)
+        if total_weight == 0:
+            dangling.append(index[gid])
+            outgoing.append(())
+        else:
+            outgoing.append(tuple(
+                (index[target], float(weight) / total_weight)
+                for _, target, weight in edges
+            ))
+
+    for _ in range(max_iter):
+        next_scores = np.full(n_nodes, (1.0 - alpha) / n_nodes)
+        next_scores += alpha * scores[dangling].sum() / n_nodes
+        for source_index, targets in enumerate(outgoing):
+            for target_index, share in targets:
+                next_scores[target_index] += alpha * scores[source_index] * share
+        if np.abs(next_scores - scores).sum() < tolerance:
+            return dict(zip(gids, next_scores))
+        scores = next_scores
+    raise RuntimeError("PageRank не сошёлся за заданное число итераций")
+
+
+def capped_log_score(values: pd.Series, quantile: float = 0.99) -> pd.Series:
+    """Нормирует положительную величину в 0..1, ограничивая влияние выбросов."""
+    cap = float(values.quantile(quantile))
+    if cap <= 0:
+        return pd.Series(0.0, index=values.index)
+    return np.log1p(values.clip(lower=0, upper=cap)) / np.log1p(cap)
+
+
 def role_thresholds(metrics: pd.DataFrame) -> dict[str, float]:
     """Пороги ролей из текущей выгрузки, а не вручную заданные константы."""
     outgoing = metrics.loc[metrics.out_deg > 0]
@@ -161,13 +210,6 @@ def assign_roles(metrics: pd.DataFrame) -> pd.DataFrame:
         0.65 + 0.10 * (result.loc[result.role.eq("distributor"), "out_deg"] / thresholds["high_out_deg"] - 1)
     ).clip(0.65, 0.95)
 
-    turnover = result.in_kzt + result.out_kzt
-    max_turnover = turnover.max()
-    result["priority_score"] = (
-        turnover / max_turnover if max_turnover > 0 else pd.Series(0.0, index=result.index)
-    )
-    result["priority_score"] = result.priority_score.fillna(0.0).clip(0.0, 1.0)
-    result["pagerank"] = 0.0  # Поле схемы; вычисление PageRank намеренно отложено.
     def evidence(row: pd.Series) -> str:
         if row.role == "consolidator":
             return (f"in_deg={row.in_deg}, in_tx={row.in_tx}, in_kzt={row.in_kzt:.0f}, "
@@ -219,6 +261,91 @@ def assign_clusters(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def cluster_statistics(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
+    """Считает размер и направленный внутренний оборот каждого кластера."""
+    cluster_by_gid = features.set_index("gid").cluster_id.to_dict()
+    internal_kzt = {cluster_id: 0.0 for cluster_id in features.cluster_id.unique()}
+    for src, dst, data in graph.edges(data=True):
+        src_cluster = cluster_by_gid[src]
+        if src_cluster == cluster_by_gid[dst]:
+            internal_kzt[src_cluster] += float(data["sum_kzt"])
+
+    stats = features.groupby("cluster_id", sort=True).agg(
+        n_nodes=("gid", "size"), n_seed=("is_seed", "sum")
+    ).reset_index()
+    stats["sum_kzt_internal"] = stats.cluster_id.map(internal_kzt).astype(float)
+    return stats
+
+
+def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет объяснимый приоритет для очереди AML-проверки.
+
+    priority_score = 30% оборот + 20% риск роли + 15% транзитность +
+                     15% PageRank + 10% близость к seed + 10% значимость кластера.
+    """
+    result = features.copy()
+    turnover = result.in_kzt + result.out_kzt
+    result["_turnover_score"] = capped_log_score(turnover)
+
+    role_weight = {
+        "consolidator": 0.90,
+        "distributor": 0.85,
+        "coordinator": 0.80,
+        "transit": 0.75,
+        "terminal": 0.45,
+        "peripheral": 0.20,
+    }
+    result["_role_score"] = result.role.map(role_weight).astype(float)
+
+    flow_score = pd.Series(0.0, index=result.index)
+    flow_nodes = (result.in_kzt > 0) & (result.out_kzt > 0) & ~result.is_seed
+    flow_score.loc[flow_nodes] = (
+        np.minimum(result.loc[flow_nodes, "in_kzt"], result.loc[flow_nodes, "out_kzt"])
+        / np.maximum(result.loc[flow_nodes, "in_kzt"], result.loc[flow_nodes, "out_kzt"])
+    )
+    result["_flow_score"] = flow_score
+
+    pagerank = weighted_pagerank(graph)
+    result["pagerank"] = result.gid.map(pagerank).fillna(0.0)
+    pagerank_cap = float(result.pagerank.quantile(0.99))
+    result["_pagerank_score"] = (
+        result.pagerank / pagerank_cap if pagerank_cap > 0 else 0.0
+    )
+    result["_pagerank_score"] = result._pagerank_score.clip(0.0, 1.0)
+
+    # depth показывает расстояние от seed в исходной 4-hop выгрузке.
+    result["_seed_depth_score"] = (1.0 - result.depth / 4.0).clip(0.0, 1.0)
+    result.loc[result.is_seed, "_seed_depth_score"] = 1.0
+
+    cluster_stats = cluster_statistics(graph, result).set_index("cluster_id")
+    cluster_turnover = result.cluster_id.map(cluster_stats.sum_kzt_internal)
+    cluster_size = result.cluster_id.map(cluster_stats.n_nodes)
+    result["_cluster_score"] = (
+        0.70 * capped_log_score(cluster_turnover)
+        + 0.30 * capped_log_score(cluster_size)
+    )
+
+    result["priority_score"] = (
+        0.30 * result._turnover_score
+        + 0.20 * result._role_score
+        + 0.15 * result._flow_score
+        + 0.15 * result._pagerank_score
+        + 0.10 * result._seed_depth_score
+        + 0.10 * result._cluster_score
+    ).clip(0.0, 1.0)
+
+    result["evidence"] = result.apply(
+        lambda row: (
+            f"{row.evidence} | priority: turn={row._turnover_score:.2f}, "
+            f"role={row._role_score:.2f}, flow={row._flow_score:.2f}, "
+            f"pr={row._pagerank_score:.2f}, seed_depth={row._seed_depth_score:.2f}, "
+            f"cluster={row._cluster_score:.2f}"
+        ),
+        axis=1,
+    )
+    return result
+
+
 def cluster_hypothesis(cluster: pd.DataFrame) -> str:
     """Формулирует короткую проверяемую гипотезу по составу сообщества."""
     counts = cluster.role.value_counts()
@@ -246,12 +373,7 @@ def cluster_hypothesis(cluster: pd.DataFrame) -> str:
 def build_cluster_summary(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
     """Собирает обязательную строку clusters.csv для каждого сообщества."""
     rows = []
-    cluster_by_gid = features.set_index("gid").cluster_id.to_dict()
-    internal_kzt = {cluster_id: 0.0 for cluster_id in features.cluster_id.unique()}
-    for src, dst, data in graph.edges(data=True):
-        src_cluster = cluster_by_gid[src]
-        if src_cluster == cluster_by_gid[dst]:
-            internal_kzt[src_cluster] += float(data["sum_kzt"])
+    stats = cluster_statistics(graph, features).set_index("cluster_id")
 
     for cluster_id, cluster in features.groupby("cluster_id", sort=True):
         top = cluster.sort_values(
@@ -261,7 +383,7 @@ def build_cluster_summary(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataF
             "cluster_id": int(cluster_id),
             "n_nodes": len(cluster),
             "n_seed": int(cluster.is_seed.sum()),
-            "sum_kzt_internal": internal_kzt[int(cluster_id)],
+            "sum_kzt_internal": float(stats.loc[cluster_id, "sum_kzt_internal"]),
             "top_gids": ",".join(map(str, top.gid)),
             "hypothesis": cluster_hypothesis(cluster),
         })
@@ -299,6 +421,7 @@ def main() -> None:
     graph = build_graph(edges)
     features = assign_roles(basic_metrics(graph, nodes))
     features = assign_clusters(graph, features)
+    features = add_priority_scores(graph, features)
     write_outputs(features, graph, args.out)
     print(f"Загружено: {len(nodes)} узлов, {len(edges)} рёбер, {len(transactions)} транзакций")
     print(f"Граф: {graph.number_of_nodes()} узлов, {graph.number_of_edges()} рёбер")
