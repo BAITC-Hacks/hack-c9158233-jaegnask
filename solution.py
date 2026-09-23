@@ -125,6 +125,44 @@ def weighted_pagerank(
     raise RuntimeError("PageRank не сошёлся за заданное число итераций")
 
 
+def weighted_hits(
+    graph: nx.DiGraph, tolerance: float = 1e-10, max_iter: int = 300
+) -> tuple[dict, dict]:
+    """Взвешенный HITS: hub для распределителей, authority для сборщиков."""
+    gids = list(graph.nodes)
+    n_nodes = len(gids)
+    if n_nodes == 0:
+        return {}, {}
+
+    index = {gid: index for index, gid in enumerate(gids)}
+    edges = [
+        (index[src], index[dst], float(data["sum_kzt"]))
+        for src, dst, data in graph.edges(data=True)
+    ]
+    hubs = np.full(n_nodes, 1.0 / np.sqrt(n_nodes))
+    authorities = np.zeros(n_nodes)
+    for _ in range(max_iter):
+        next_authorities = np.zeros(n_nodes)
+        for source, target, weight in edges:
+            next_authorities[target] += hubs[source] * weight
+        authority_norm = np.linalg.norm(next_authorities)
+        if authority_norm > 0:
+            next_authorities /= authority_norm
+
+        next_hubs = np.zeros(n_nodes)
+        for source, target, weight in edges:
+            next_hubs[source] += next_authorities[target] * weight
+        hub_norm = np.linalg.norm(next_hubs)
+        if hub_norm > 0:
+            next_hubs /= hub_norm
+
+        delta = np.abs(next_hubs - hubs).sum() + np.abs(next_authorities - authorities).sum()
+        hubs, authorities = next_hubs, next_authorities
+        if delta < tolerance:
+            return dict(zip(gids, hubs)), dict(zip(gids, authorities))
+    raise RuntimeError("HITS не сошёлся за заданное число итераций")
+
+
 def capped_log_score(values: pd.Series, quantile: float = 0.99) -> pd.Series:
     """Нормирует положительную величину в 0..1, ограничивая влияние выбросов."""
     cap = float(values.quantile(quantile))
@@ -171,6 +209,37 @@ def temporal_features(transactions: pd.DataFrame, nodes: pd.DataFrame) -> pd.Dat
     # Для seed входящие средства не полностью представлены в 4-hop выборке.
     result.loc[result.is_seed, "transit_timing_score"] = 0.0
     return result.drop(columns="is_seed")
+
+
+def graph_structural_features(graph: nx.DiGraph, nodes: pd.DataFrame) -> pd.DataFrame:
+    """Нормирует HITS и directed betweenness в дополнительные признаки 0..1."""
+    hubs, authorities = weighted_hits(graph)
+    shortest_path_graph = graph.copy()
+    for _, _, data in shortest_path_graph.edges(data=True):
+        # Крупный денежный поток интерпретируется как более сильная связь.
+        data["distance"] = 1.0 / float(data["sum_kzt"])
+    betweenness = nx.betweenness_centrality(
+        shortest_path_graph, weight="distance", normalized=True
+    )
+
+    result = nodes[["gid"]].copy()
+    result["hub_score"] = result.gid.map(hubs).fillna(0.0)
+    result["authority_score"] = result.gid.map(authorities).fillna(0.0)
+    result["betweenness_score"] = result.gid.map(betweenness).fillna(0.0)
+    for column in ("hub_score", "authority_score", "betweenness_score"):
+        result[column] = capped_log_score(result[column])
+    return result
+
+
+def add_graph_role_support(features: pd.DataFrame) -> pd.DataFrame:
+    """Подтверждает уже назначенную роль структурным сигналом, не меняя label."""
+    result = features.copy()
+    result["_role_graph_support"] = 0.0
+    result.loc[result.role.eq("distributor"), "_role_graph_support"] = result.hub_score
+    result.loc[result.role.eq("consolidator"), "_role_graph_support"] = result.authority_score
+    result.loc[result.role.eq("transit"), "_role_graph_support"] = result.betweenness_score
+    result["role_score"] = (result.role_score + 0.05 * result._role_graph_support).clip(0.0, 1.0)
+    return result
 
 
 def role_thresholds(metrics: pd.DataFrame) -> dict[str, float]:
@@ -320,9 +389,8 @@ def cluster_statistics(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFram
 def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
     """Добавляет объяснимый приоритет для очереди AML-проверки.
 
-    priority_score = 28% оборот + 19% риск роли + 14% транзитность +
-                     14% PageRank + 9% близость к seed + 9% значимость кластера +
-                     7% временная активность.
+    priority_score = 95% предыдущих бизнес-факторов + 5% структурный сигнал,
+    где структурный сигнал = HITS hub, HITS authority и betweenness.
     """
     result = features.copy()
     turnover = result.in_kzt + result.out_kzt
@@ -368,8 +436,13 @@ def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFra
     result["_temporal_score"] = (
         0.60 * result.frequency_score + 0.40 * result.transit_timing_score
     )
+    result["_structural_score"] = (
+        0.34 * result.hub_score
+        + 0.33 * result.authority_score
+        + 0.33 * result.betweenness_score
+    )
 
-    result["priority_score"] = (
+    base_priority = (
         0.28 * result._turnover_score
         + 0.19 * result._role_score
         + 0.14 * result._flow_score
@@ -377,16 +450,19 @@ def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFra
         + 0.09 * result._seed_depth_score
         + 0.09 * result._cluster_score
         + 0.07 * result._temporal_score
-    ).clip(0.0, 1.0)
+    )
+    result["priority_score"] = (0.95 * base_priority + 0.05 * result._structural_score).clip(0.0, 1.0)
 
     result["evidence"] = result.apply(
         lambda row: (
             f"{row.evidence} | p:t={row._turnover_score:.2f},r={row._role_score:.2f},"
             f"f={row._flow_score:.2f},pr={row._pagerank_score:.2f},"
             f"sd={row._seed_depth_score:.2f},c={row._cluster_score:.2f},"
-            f"time={row._temporal_score:.2f} | time:days={row.active_days},"
-            f"tx={row.tx_count_total},avg={row.avg_tx_amount:.0f},"
-            f"freq={row.frequency_score:.2f},timing={row.transit_timing_score:.2f}"
+            f"tm={row._temporal_score:.2f},g={row._structural_score:.2f} | "
+            f"tm:d={row.active_days},"
+            f"tx={row.tx_count_total},av={row.avg_tx_amount:.0f},"
+            f"fr={row.frequency_score:.2f},ti={row.transit_timing_score:.2f} | "
+            f"g={row.hub_score:.2f}/{row.authority_score:.2f}/{row.betweenness_score:.2f}"
         ),
         axis=1,
     )
@@ -469,6 +545,8 @@ def main() -> None:
     features = assign_roles(basic_metrics(graph, nodes))
     features = assign_clusters(graph, features)
     features = features.merge(temporal_features(transactions, nodes), on="gid", how="left")
+    features = features.merge(graph_structural_features(graph, nodes), on="gid", how="left")
+    features = add_graph_role_support(features)
     features = add_priority_scores(graph, features)
     write_outputs(features, graph, args.out)
     print(f"Загружено: {len(nodes)} узлов, {len(edges)} рёбер, {len(transactions)} транзакций")
