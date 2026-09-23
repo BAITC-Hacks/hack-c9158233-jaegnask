@@ -6,6 +6,7 @@
 """
 
 import argparse
+import itertools
 from pathlib import Path
 
 import networkx as nx
@@ -231,6 +232,68 @@ def graph_structural_features(graph: nx.DiGraph, nodes: pd.DataFrame) -> pd.Data
     return result
 
 
+def suspicious_patterns(
+    graph: nx.DiGraph, transactions: pd.DataFrame, features: pd.DataFrame
+) -> pd.DataFrame:
+    """Находит типовые AML-паттерны без изменения роли или priority_score."""
+    patterns = {gid: [] for gid in features.gid}
+
+    high_in_deg = max(3, float(features.in_deg.quantile(0.95)))
+    high_in_tx = float(features.in_tx.quantile(0.95))
+    fan_in = (features.in_deg >= high_in_deg) & (features.in_tx >= high_in_tx)
+    for gid in features.loc[fan_in, "gid"]:
+        patterns[gid].append("fan-in")
+
+    outgoing = features.loc[features.out_deg > 0]
+    high_out_deg = float(outgoing.out_deg.quantile(0.90))
+    high_out_tx = float(outgoing.out_tx.quantile(0.90))
+    fan_out = (features.out_deg >= high_out_deg) & (features.out_tx >= high_out_tx)
+    for gid in features.loc[fan_out, "gid"]:
+        patterns[gid].append("fan-out")
+
+    rapid = (
+        (features.in_kzt > 0)
+        & (features.out_kzt > 0)
+        & ~features.is_seed
+        & features.pass_through.between(0.60, 1.50)
+        & (features.transit_timing_score >= 5 / 7)
+    )
+    for gid in features.loc[rapid, "gid"]:
+        patterns[gid].append("rapid transit")
+
+    outgoing_tx = transactions.groupby("src").sum_kzt.agg(["size", "sum", "mean"])
+    outgoing_tx.columns = ["tx_count", "total_kzt", "avg_kzt"]
+    split = outgoing_tx.loc[
+        (outgoing_tx.tx_count >= outgoing_tx.tx_count.quantile(0.90))
+        & (outgoing_tx.total_kzt >= outgoing_tx.total_kzt.quantile(0.75))
+        & (outgoing_tx.avg_kzt <= outgoing_tx.avg_kzt.quantile(0.50))
+    ]
+    for gid in split.index:
+        patterns[gid].append("split payments")
+
+    # Ограничение длины 4 и первые 500 циклов не дают дорогого полного перебора.
+    for cycle in itertools.islice(nx.simple_cycles(graph, length_bound=4), 500):
+        for gid in cycle:
+            patterns[gid].append("circular flow")
+
+    # Малый слабосвязный компонент с переводами — изолированный денежный остров.
+    for component in nx.weakly_connected_components(graph):
+        if 2 <= len(component) <= 5:
+            for gid in component:
+                patterns[gid].append("money island")
+
+    pattern_order = [
+        "fan-in", "fan-out", "rapid transit", "split payments", "circular flow", "money island",
+    ]
+    return pd.DataFrame({
+        "gid": features.gid,
+        "patterns": [
+            ", ".join(name for name in pattern_order if name in set(patterns[gid]))
+            for gid in features.gid
+        ],
+    })
+
+
 def add_graph_role_support(features: pd.DataFrame) -> pd.DataFrame:
     """Подтверждает уже назначенную роль структурным сигналом, не меняя label."""
     result = features.copy()
@@ -398,11 +461,12 @@ def human_evidence(row: pd.Series) -> str:
         f"Приоритет {row.priority_score:.2f}: оборот {turnover}, "
         f"PageRank {row.pagerank:.6f}, кластер {int(row._cluster_n_nodes)} уз."
     )
+    pattern_note = f" AML-паттерны: {row.patterns}." if row.patterns else ""
 
     if row.truncated_by_depth:
         return (
             f"Depth=4: граф обрезан, terminal не подтверждён. Роль peripheral. "
-            f"Получил {format_kzt(row.in_kzt)}, исходящих 0. {priority}"
+            f"Получил {format_kzt(row.in_kzt)}, исходящих 0.{pattern_note} {priority}"
         )
     if row.role == "transit":
         text = (
@@ -443,7 +507,36 @@ def human_evidence(row: pd.Series) -> str:
 
     if row.active_days > 1 and row._temporal_score >= 0.50:
         text += f" Активен {int(row.active_days)} дн."
-    return f"{text} {priority}"
+    evidence = f"{text}{pattern_note} {priority}"
+    if len(evidence) <= 200:
+        return evidence
+    # Компактный вариант сохраняет роль, числа, все AML-паттерны и приоритет.
+    compact_patterns = (
+        row.patterns.replace("rapid transit", "rapid")
+        .replace("split payments", "split")
+        .replace("circular flow", "cycle")
+        .replace("money island", "island")
+    )
+    if row.truncated_by_depth:
+        return (
+            f"Depth=4: граф обрезан, terminal не подтверждён. AML: {compact_patterns}. "
+            f"Приоритет {row.priority_score:.2f}, кластер {int(row._cluster_n_nodes)} уз."
+        )
+    if row.role == "transit":
+        compact_role = (
+            f"Транзит: вход {format_kzt(row.in_kzt)}, выход {format_kzt(row.out_kzt)}, "
+            f"{row.pass_through * 100:.0f}% дальше."
+        )
+    elif row.role == "consolidator":
+        compact_role = f"Сборщик: вход {format_kzt(row.in_kzt)} от {int(row.in_deg)} контрагентов."
+    elif row.role == "distributor":
+        compact_role = f"Распределитель: выход {format_kzt(row.out_kzt)} к {int(row.out_deg)} получателям."
+    else:
+        compact_role = f"{row.role}: вход {format_kzt(row.in_kzt)}, выход {format_kzt(row.out_kzt)}."
+    return (
+        f"{compact_role} AML: {compact_patterns}. Приоритет {row.priority_score:.2f}: "
+        f"PR {row.pagerank:.6f}, кластер {int(row._cluster_n_nodes)} уз."
+    )
 
 
 def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
@@ -595,6 +688,7 @@ def main() -> None:
     features = assign_clusters(graph, features)
     features = features.merge(temporal_features(transactions, nodes), on="gid", how="left")
     features = features.merge(graph_structural_features(graph, nodes), on="gid", how="left")
+    features = features.merge(suspicious_patterns(graph, transactions, features), on="gid", how="left")
     features = add_graph_role_support(features)
     features = add_priority_scores(graph, features)
     write_outputs(features, graph, args.out)
