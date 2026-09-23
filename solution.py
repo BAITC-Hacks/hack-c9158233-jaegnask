@@ -161,8 +161,6 @@ def assign_roles(metrics: pd.DataFrame) -> pd.DataFrame:
         0.65 + 0.10 * (result.loc[result.role.eq("distributor"), "out_deg"] / thresholds["high_out_deg"] - 1)
     ).clip(0.65, 0.95)
 
-    # Один технический кластер на MVP: это гарантирует согласованность двух выгрузок.
-    result["cluster_id"] = 0
     turnover = result.in_kzt + result.out_kzt
     max_turnover = turnover.max()
     result["priority_score"] = (
@@ -192,21 +190,91 @@ def assign_roles(metrics: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def write_outputs(features: pd.DataFrame, out_dir: Path) -> None:
+def assign_clusters(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
+    """Выделяет сообщества на неориентированной проекции денежного графа."""
+    projection = nx.Graph()
+    projection.add_nodes_from(features.gid)
+    for src, dst, data in graph.edges(data=True):
+        weight = float(data["sum_kzt"])
+        if projection.has_edge(src, dst):
+            projection[src][dst]["sum_kzt"] += weight
+        else:
+            projection.add_edge(src, dst, sum_kzt=weight)
+
+    communities = nx.community.louvain_communities(
+        projection, weight="sum_kzt", seed=42
+    )
+    # Стабильные номера: сначала крупные сообщества, затем по минимальному gid.
+    communities = sorted(
+        communities,
+        key=lambda community: (-len(community), min(map(str, community))),
+    )
+    cluster_by_gid = {
+        gid: cluster_id
+        for cluster_id, community in enumerate(communities)
+        for gid in community
+    }
+    result = features.copy()
+    result["cluster_id"] = result.gid.map(cluster_by_gid).astype(int)
+    return result
+
+
+def cluster_hypothesis(cluster: pd.DataFrame) -> str:
+    """Формулирует короткую проверяемую гипотезу по составу сообщества."""
+    counts = cluster.role.value_counts()
+    n_nodes = len(cluster)
+    n_distributors = int(counts.get("distributor", 0))
+    n_coordinators = int(counts.get("coordinator", 0))
+    n_consolidators = int(counts.get("consolidator", 0))
+    n_transit = int(counts.get("transit", 0))
+    n_terminal = int(counts.get("terminal", 0))
+
+    if n_nodes == 1 and cluster.iloc[0].in_deg == 0 and cluster.iloc[0].out_deg == 0:
+        return "Изолированный узел: in_deg=0, out_deg=0"
+    if n_distributors + n_coordinators > 0:
+        return (f"Контур распределения: distributors={n_distributors}, "
+                f"coordinators={n_coordinators}, nodes={n_nodes}")
+    if n_consolidators > 0:
+        return f"Контур сбора: consolidators={n_consolidators}, nodes={n_nodes}"
+    if n_transit >= max(2, n_nodes // 3):
+        return f"Транзитный контур: transit={n_transit}, nodes={n_nodes}"
+    if n_terminal >= max(1, n_nodes // 2):
+        return f"Ветка конечных получателей: terminal={n_terminal}, nodes={n_nodes}"
+    return f"Смешанный денежный контур: transit={n_transit}, terminal={n_terminal}, nodes={n_nodes}"
+
+
+def build_cluster_summary(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
+    """Собирает обязательную строку clusters.csv для каждого сообщества."""
+    rows = []
+    cluster_by_gid = features.set_index("gid").cluster_id.to_dict()
+    internal_kzt = {cluster_id: 0.0 for cluster_id in features.cluster_id.unique()}
+    for src, dst, data in graph.edges(data=True):
+        src_cluster = cluster_by_gid[src]
+        if src_cluster == cluster_by_gid[dst]:
+            internal_kzt[src_cluster] += float(data["sum_kzt"])
+
+    for cluster_id, cluster in features.groupby("cluster_id", sort=True):
+        top = cluster.sort_values(
+            ["priority_score", "gid"], ascending=[False, True]
+        ).head(10)
+        rows.append({
+            "cluster_id": int(cluster_id),
+            "n_nodes": len(cluster),
+            "n_seed": int(cluster.is_seed.sum()),
+            "sum_kzt_internal": internal_kzt[int(cluster_id)],
+            "top_gids": ",".join(map(str, top.gid)),
+            "hypothesis": cluster_hypothesis(cluster),
+        })
+    return pd.DataFrame(rows, columns=OUTPUT_COLUMNS["clusters"])
+
+
+def write_outputs(features: pd.DataFrame, graph: nx.DiGraph, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     nodes_roles = features[OUTPUT_COLUMNS["nodes_roles"]].copy()
     nodes_roles.to_csv(out_dir / "nodes_roles.csv", index=False)
 
     ordered = features.sort_values(["priority_score", "gid"], ascending=[False, True])
-    top_gids = ",".join(map(str, ordered.head(10).gid))
-    clusters = pd.DataFrame([{
-        "cluster_id": 0,
-        "n_nodes": len(features),
-        "n_seed": int(features.is_seed.sum()),
-        "sum_kzt_internal": float(features.out_kzt.sum()),
-        "top_gids": top_gids,
-        "hypothesis": "MVP: единый технический кластер без содержательной интерпретации",
-    }], columns=OUTPUT_COLUMNS["clusters"])
+    clusters = build_cluster_summary(graph, features)
     clusters.to_csv(out_dir / "clusters.csv", index=False)
 
     top_count = min(20, len(ordered))
@@ -230,7 +298,8 @@ def main() -> None:
     edges, nodes, transactions = load_data(args.data)
     graph = build_graph(edges)
     features = assign_roles(basic_metrics(graph, nodes))
-    write_outputs(features, args.out)
+    features = assign_clusters(graph, features)
+    write_outputs(features, graph, args.out)
     print(f"Загружено: {len(nodes)} узлов, {len(edges)} рёбер, {len(transactions)} транзакций")
     print(f"Граф: {graph.number_of_nodes()} узлов, {graph.number_of_edges()} рёбер")
     print(f"Выгрузки записаны в: {args.out}")
