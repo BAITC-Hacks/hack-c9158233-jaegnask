@@ -656,6 +656,57 @@ def build_cluster_summary(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataF
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS["clusters"])
 
 
+def write_largest_cluster_svg(
+    features: pd.DataFrame, graph: nx.DiGraph, clusters: pd.DataFrame, out_dir: Path
+) -> None:
+    """Рисует компактную локальную карту крупнейшего кластера без новых зависимостей."""
+    largest_id = int(clusters.loc[clusters.n_nodes.idxmax(), "cluster_id"])
+    cluster = features.loc[features.cluster_id == largest_id].copy()
+    subgraph = graph.subgraph(cluster.gid).copy()
+    positions = nx.spring_layout(subgraph, seed=42, iterations=80, weight="sum_kzt")
+    width, height, margin = 1200, 850, 70
+    colors = {
+        "consolidator": "#7c3aed", "transit": "#0284c7", "distributor": "#ea580c",
+        "coordinator": "#db2777", "terminal": "#16a34a", "peripheral": "#64748b",
+    }
+
+    def point(gid: object) -> tuple[float, float]:
+        x, y = positions[gid]
+        return margin + (x + 1) * (width - 2 * margin) / 2, margin + (y + 1) * (height - 2 * margin) / 2
+
+    node_info = cluster.set_index("gid")
+    edges = "".join(
+        f'<line x1="{point(src)[0]:.1f}" y1="{point(src)[1]:.1f}" '
+        f'x2="{point(dst)[0]:.1f}" y2="{point(dst)[1]:.1f}" class="edge" marker-end="url(#arrow)" />'
+        for src, dst in subgraph.edges()
+    )
+    nodes = []
+    top_gids = set(cluster.nlargest(15, "priority_score").gid)
+    for gid, row in node_info.iterrows():
+        x, y = point(gid)
+        radius = 3.5 + 8 * float(row.priority_score)
+        title = html.escape(
+            f"gid {gid}; {row.role}; priority {row.priority_score:.3f}; {row.evidence}", quote=True
+        )
+        node = (
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}" fill="{colors[row.role]}" '
+            f'class="node"><title>{title}</title></circle>'
+        )
+        if gid in top_gids:
+            node += f'<text x="{x + radius + 2:.1f}" y="{y + 4:.1f}">{html.escape(str(gid))}</text>'
+        nodes.append(node)
+    legend = "".join(
+        f'<span><i style="background:{color}"></i>{html.escape(role)}</span>'
+        for role, color in colors.items()
+    )
+    svg = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Крупнейший AML-кластер</title>
+<style>body{{font-family:Arial,sans-serif;margin:24px;color:#172033}} .muted{{color:#5e6b7a}} .legend span{{margin-right:18px;white-space:nowrap}} i{{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:5px}} svg{{max-width:100%;height:auto;border:1px solid #dce3ec;background:#fbfdff}} .edge{{stroke:#94a3b8;stroke-width:1;opacity:.35}} .node{{stroke:#fff;stroke-width:1}} text{{font-size:10px;fill:#172033}}</style>
+</head><body><h1>Карта крупнейшего кластера #{largest_id}</h1><p class="muted">{len(cluster)} узлов, {subgraph.number_of_edges()} внутренних направленных рёбер. Цвет — роль, размер — priority score. Подписи даны только 15 наиболее приоритетным узлам; наведите курсор на узел для деталей.</p>
+<p class="legend">{legend}</p><svg viewBox="0 0 {width} {height}" role="img" aria-label="Карта крупнейшего кластера"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker></defs>{edges}{''.join(nodes)}</svg>
+</body></html>'''
+    (out_dir / "largest_cluster.svg").write_text(svg, encoding="utf-8")
+
+
 def write_html_report(
     features: pd.DataFrame,
     graph: nx.DiGraph,
@@ -735,6 +786,7 @@ th{{background:#eef5fb;white-space:nowrap}} tr:hover{{background:#f8fbff}} ul{{l
 <section><h2>Распределение AML-паттернов</h2><p class="muted">Один узел может иметь несколько паттернов; это сигналы для проверки, а не доказательство нарушения.</p><table><tr><th>Паттерн</th><th>Узлов</th></tr>{pattern_rows}</table></section>
 <section><h2>Top-20 приоритетных узлов</h2><table><tr><th>#</th><th>gid</th><th>Роль</th><th>Priority</th><th>Кластер</th><th>Объяснение</th></tr>{top_rows}</table></section>
 <section><h2>Top-10 кластеров по внутреннему обороту</h2><table><tr><th>Кластер</th><th>Узлов</th><th>Seed</th><th>Внутренний оборот</th><th>Гипотеза</th></tr>{cluster_rows}</table></section>
+<section><h2>Карта крупнейшего кластера</h2><p>Цветом показана роль, размером — priority score, стрелкой — направление перевода. <a href="largest_cluster.svg">Открыть локальную SVG-карту кластера #{int(largest.cluster_id)}</a>.</p></section>
 <section><h2>Интересные факты</h2><ul>
 <li>Наивысший приоритет: gid <strong>{esc(top.gid)}</strong>, роль <strong>{esc(top.role)}</strong>, score <strong>{top.priority_score:.3f}</strong>.</li>
 <li>Крупнейший кластер: #{int(largest.cluster_id)} — {int(largest.n_nodes)} узлов, внутренний оборот {kzt(largest.sum_kzt_internal)}.</li>
@@ -770,6 +822,7 @@ def write_outputs(features: pd.DataFrame, graph: nx.DiGraph, out_dir: Path) -> N
         "why": top_nodes.evidence,
     })
     top_nodes.to_csv(out_dir / "top_nodes.csv", index=False)
+    write_largest_cluster_svg(features, graph, clusters, out_dir)
     write_html_report(features, graph, clusters, ordered, out_dir)
 
 
