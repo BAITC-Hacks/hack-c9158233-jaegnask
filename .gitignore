@@ -1,3 +1,9 @@
-out/
+out/*
+!out/nodes_roles.csv
+!out/clusters.csv
+!out/top_nodes.csv
+!out/report.html
+!out/network.html
+!out/largest_cluster.html
 __pycache__/
 .DS_Store

@@ -711,6 +711,123 @@ def write_largest_cluster_html(
     (out_dir / "largest_cluster.html").write_text(svg, encoding="utf-8")
 
 
+def write_network_view(
+    features: pd.DataFrame, graph: nx.DiGraph, clusters: pd.DataFrame, out_dir: Path
+) -> None:
+    """Создаёт локальный экран всей сети с поиском gid и просмотром связей."""
+    role_colors = {
+        "consolidator": "#7c3aed", "transit": "#0284c7", "distributor": "#ea580c",
+        "coordinator": "#db2777", "terminal": "#16a34a", "peripheral": "#64748b",
+    }
+    cluster_palette = [
+        "#0f766e", "#1d4ed8", "#7c3aed", "#be123c", "#c2410c", "#4d7c0f",
+        "#0369a1", "#6d28d9", "#a21caf", "#b45309", "#047857", "#4338ca",
+    ]
+    panel_width, panel_height, panel_gap, columns = 520, 360, 30, 4
+    margin_x, margin_y = 35, 65
+    positions: dict[object, tuple[float, float]] = {}
+    cluster_boxes = []
+
+    ordered_clusters = clusters.sort_values(
+        ["n_nodes", "cluster_id"], ascending=[False, True]
+    ).reset_index(drop=True)
+    for index, summary in ordered_clusters.iterrows():
+        cluster_id = int(summary.cluster_id)
+        col, row = index % columns, index // columns
+        left = margin_x + col * (panel_width + panel_gap)
+        top = margin_y + row * (panel_height + panel_gap)
+        color = cluster_palette[cluster_id % len(cluster_palette)]
+        cluster_boxes.append(
+            f'<rect x="{left}" y="{top}" width="{panel_width}" height="{panel_height}" '
+            f'rx="12" fill="#ffffff" stroke="{color}" stroke-width="2" opacity=".92" />'
+            f'<text x="{left + 12}" y="{top + 23}" class="cluster-label">'
+            f'cluster {cluster_id} · {int(summary.n_nodes)} уз.</text>'
+        )
+        gids = features.loc[features.cluster_id == cluster_id, "gid"].tolist()
+        subgraph = graph.subgraph(gids).copy()
+        subgraph.add_nodes_from(gids)
+        local = nx.spring_layout(
+            subgraph, seed=42 + cluster_id, iterations=30, weight="sum_kzt"
+        )
+        inner_left, inner_top = left + 28, top + 42
+        inner_width, inner_height = panel_width - 56, panel_height - 68
+        for gid, (x, y) in local.items():
+            positions[gid] = (
+                inner_left + (float(x) + 1.0) * inner_width / 2,
+                inner_top + (float(y) + 1.0) * inner_height / 2,
+            )
+
+    rows = (len(ordered_clusters) + columns - 1) // columns
+    width = margin_x * 2 + columns * panel_width + (columns - 1) * panel_gap
+    height = margin_y + rows * panel_height + max(0, rows - 1) * panel_gap + 35
+    edge_elements = "".join(
+        f'<line x1="{positions[src][0]:.1f}" y1="{positions[src][1]:.1f}" '
+        f'x2="{positions[dst][0]:.1f}" y2="{positions[dst][1]:.1f}" '
+        f'class="edge" data-src="{html.escape(str(src), quote=True)}" '
+        f'data-dst="{html.escape(str(dst), quote=True)}" marker-end="url(#arrow)" />'
+        for src, dst in graph.edges()
+    )
+    node_rows = features.set_index("gid")
+    node_elements = []
+    for gid, row in node_rows.iterrows():
+        x, y = positions[gid]
+        radius = 3.0 + 5.0 * float(row.priority_score)
+        title = html.escape(
+            f"gid {gid}; роль {row.role}; кластер {int(row.cluster_id)}; "
+            f"triage {row.priority_score:.3f}; {row.evidence}",
+            quote=True,
+        )
+        node_elements.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}" '
+            f'fill="{role_colors[row.role]}" class="node" id="node-{gid}" '
+            f'data-gid="{html.escape(str(gid), quote=True)}" data-role="{row.role}" '
+            f'data-cluster="{int(row.cluster_id)}" data-priority="{row.priority_score:.6f}" '
+            f'data-evidence="{html.escape(row.evidence, quote=True)}"><title>{title}</title></circle>'
+        )
+    role_legend = "".join(
+        f'<span><i style="background:{color}"></i>{role}</span>'
+        for role, color in role_colors.items()
+    )
+
+    page = f'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Сеть переводов — поиск gid</title>
+<style>
+body{{font-family:Arial,sans-serif;margin:24px;color:#172033;background:#f7f9fc}} h1{{margin-bottom:6px}} .muted{{color:#5e6b7a}}
+.toolbar{{position:sticky;top:0;z-index:5;background:#fff;border:1px solid #dce3ec;border-radius:10px;padding:14px;margin-bottom:14px;box-shadow:0 3px 12px #0f172a18}}
+form{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}} input{{min-width:280px;padding:9px 11px;border:1px solid #94a3b8;border-radius:6px;font-size:15px}} button{{padding:9px 14px;border:0;border-radius:6px;background:#075985;color:#fff;cursor:pointer}} button.secondary{{background:#475569}}
+.legend{{margin:12px 0}} .legend span{{margin-right:16px;white-space:nowrap}} i{{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:5px}}
+#result{{min-height:22px;margin-top:9px;font-weight:600}} .canvas{{overflow:auto;max-height:72vh;border:1px solid #cbd5e1;background:#eef2f7;border-radius:8px}}
+svg{{display:block;background:#eef2f7}} .edge{{stroke:#94a3b8;stroke-width:.8;opacity:.30}} .node{{stroke:#fff;stroke-width:1;cursor:pointer}} .cluster-label{{font-size:13px;font-weight:700;fill:#334155}}
+.dim{{opacity:.055!important}} .edge.selected{{stroke:#dc2626;stroke-width:2.5;opacity:.95}} .node.selected{{stroke:#dc2626;stroke-width:4;opacity:1}} .node.neighbor{{stroke:#f59e0b;stroke-width:3;opacity:1}}
+</style></head><body>
+<h1>Сеть переводов</h1><p class="muted">Все {len(features)} узлов и {graph.number_of_edges()} направленных рёбер. Цвет узла — роль; рамка и подпись панели — кластер. Поиск подсвечивает выбранный gid, его непосредственных контрагентов и направления связей.</p>
+<div class="toolbar"><form id="search-form"><label for="gid"><strong>Найти gid:</strong></label><input id="gid" name="gid" inputmode="numeric" placeholder="Например, {features.iloc[0].gid}" autocomplete="off"><button type="submit">Показать связи</button><button type="button" class="secondary" id="reset">Сбросить</button></form>
+<div class="legend">{role_legend}</div><div id="result" aria-live="polite">Введите полный gid.</div></div>
+<div class="canvas"><svg id="network" viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img" aria-label="Граф переводов по кластерам"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker></defs>{''.join(cluster_boxes)}{edge_elements}{''.join(node_elements)}</svg></div>
+<script>
+const nodes=[...document.querySelectorAll('.node')];
+const edges=[...document.querySelectorAll('.edge')];
+const result=document.getElementById('result');
+function resetView(){{nodes.forEach(n=>n.classList.remove('dim','selected','neighbor'));edges.forEach(e=>e.classList.remove('dim','selected'));result.textContent='Введите полный gid.';}}
+function showNode(gid){{
+  const selected=document.querySelector('.node[data-gid="'+CSS.escape(gid)+'"]');
+  if(!selected){{result.textContent='gid '+gid+' не найден в выборке.';return;}}
+  nodes.forEach(n=>{{n.classList.add('dim');n.classList.remove('selected','neighbor');}});
+  edges.forEach(e=>{{e.classList.add('dim');e.classList.remove('selected');}});
+  selected.classList.remove('dim');selected.classList.add('selected');
+  const neighbors=new Set();let incoming=0,outgoing=0;
+  edges.forEach(e=>{{if(e.dataset.src===gid||e.dataset.dst===gid){{e.classList.remove('dim');e.classList.add('selected');const other=e.dataset.src===gid?e.dataset.dst:e.dataset.src;neighbors.add(other);if(e.dataset.src===gid)outgoing++;else incoming++;}}}});
+  nodes.forEach(n=>{{if(neighbors.has(n.dataset.gid)){{n.classList.remove('dim');n.classList.add('neighbor');}}}});
+  result.textContent='gid '+gid+' · роль '+selected.dataset.role+' · кластер '+selected.dataset.cluster+' · triage '+selected.dataset.priority+' · IN-связей '+incoming+' · OUT-связей '+outgoing+' · '+selected.dataset.evidence;
+  selected.scrollIntoView({{behavior:'smooth',block:'center',inline:'center'}});
+}}
+document.getElementById('search-form').addEventListener('submit',event=>{{event.preventDefault();showNode(document.getElementById('gid').value.trim());}});
+document.getElementById('reset').addEventListener('click',resetView);
+nodes.forEach(node=>node.addEventListener('click',()=>{{document.getElementById('gid').value=node.dataset.gid;showNode(node.dataset.gid);}}));
+</script></body></html>'''
+    (out_dir / "network.html").write_text(page, encoding="utf-8")
+
+
 def write_html_report(
     features: pd.DataFrame,
     graph: nx.DiGraph,
@@ -803,6 +920,7 @@ table{{border-collapse:collapse;width:100%;font-size:14px}} th,td{{padding:9px;b
 th{{background:#eef5fb;white-space:nowrap}} tr:hover{{background:#f8fbff}} ul{{line-height:1.55}} .note{{background:#fff8db;padding:12px;border-radius:6px}} details{{margin:9px 0;border:1px solid #e6ebf1;border-radius:6px;padding:10px}} summary{{cursor:pointer;font-weight:700;color:#075985}}
 </style></head><body>
 <h1>AML Graph Analysis</h1><p class="muted">Статический отчёт, созданный командой <code>python3 solution.py --data data --out out</code>.</p>
+<p><a href="network.html"><strong>Открыть всю сеть и найти любой gid</strong></a></p>
 <div class="cards">
 <div class="card"><div class="muted">Узлов</div><div class="value">{len(features)}</div></div>
 <div class="card"><div class="muted">Направленных рёбер</div><div class="value">{graph.number_of_edges()}</div></div>
@@ -853,6 +971,7 @@ def write_outputs(
         "why": top_nodes.evidence,
     })
     top_nodes.to_csv(out_dir / "top_nodes.csv", index=False)
+    write_network_view(features, graph, clusters, out_dir)
     write_largest_cluster_html(features, graph, clusters, out_dir)
     write_html_report(features, graph, clusters, ordered, transactions, out_dir)
 
