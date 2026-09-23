@@ -386,6 +386,66 @@ def cluster_statistics(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFram
     return stats
 
 
+def format_kzt(amount: float) -> str:
+    """Короткое точное форматирование суммы для текста аналитика."""
+    return f"{amount:,.0f}".replace(",", " ") + " KZT"
+
+
+def human_evidence(row: pd.Series) -> str:
+    """Формирует короткое объяснение роли и приоритета для AML-аналитика."""
+    turnover = format_kzt(row.in_kzt + row.out_kzt)
+    priority = (
+        f"Приоритет {row.priority_score:.2f}: оборот {turnover}, "
+        f"PageRank {row.pagerank:.6f}, кластер {int(row._cluster_n_nodes)} уз."
+    )
+
+    if row.truncated_by_depth:
+        return (
+            f"Depth=4: граф обрезан, terminal не подтверждён. Роль peripheral. "
+            f"Получил {format_kzt(row.in_kzt)}, исходящих 0. {priority}"
+        )
+    if row.role == "transit":
+        text = (
+            f"Транзит: получил {format_kzt(row.in_kzt)}, отправил {format_kzt(row.out_kzt)}; "
+            f"{row.pass_through * 100:.0f}% прошло дальше."
+        )
+        if row.betweenness_score >= 0.20:
+            text += f" Посредничество {row.betweenness_score:.2f}."
+    elif row.role == "consolidator":
+        text = (
+            f"Сборщик: получил {format_kzt(row.in_kzt)} от {int(row.in_deg)} контрагентов "
+            f"в {int(row.in_tx)} переводах; отправил {format_kzt(row.out_kzt)}."
+        )
+        if row.authority_score >= 0.20:
+            text += f" Authority {row.authority_score:.2f}."
+    elif row.role == "distributor":
+        text = (
+            f"Распределитель: отправил {format_kzt(row.out_kzt)} в {int(row.out_tx)} переводах "
+            f"{int(row.out_deg)} получателям."
+        )
+        if row.hub_score >= 0.20:
+            text += f" Hub {row.hub_score:.2f}."
+    elif row.role == "coordinator":
+        text = (
+            f"Координатор seed: отправил {format_kzt(row.out_kzt)} в {int(row.out_tx)} переводах "
+            f"{int(row.out_deg)} получателям."
+        )
+    elif row.role == "terminal":
+        text = (
+            f"Конечный в выборке: получил {format_kzt(row.in_kzt)} в {int(row.in_tx)} переводах; "
+            "исходящих переводов 0."
+        )
+    else:
+        text = (
+            f"Периферийный: получил {format_kzt(row.in_kzt)}, отправил {format_kzt(row.out_kzt)}; "
+            f"связей вход/выход {int(row.in_deg)}/{int(row.out_deg)}."
+        )
+
+    if row.active_days > 1 and row._temporal_score >= 0.50:
+        text += f" Активен {int(row.active_days)} дн."
+    return f"{text} {priority}"
+
+
 def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
     """Добавляет объяснимый приоритет для очереди AML-проверки.
 
@@ -429,6 +489,7 @@ def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFra
     cluster_stats = cluster_statistics(graph, result).set_index("cluster_id")
     cluster_turnover = result.cluster_id.map(cluster_stats.sum_kzt_internal)
     cluster_size = result.cluster_id.map(cluster_stats.n_nodes)
+    result["_cluster_n_nodes"] = cluster_size.astype(int)
     result["_cluster_score"] = (
         0.70 * capped_log_score(cluster_turnover)
         + 0.30 * capped_log_score(cluster_size)
@@ -453,19 +514,7 @@ def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFra
     )
     result["priority_score"] = (0.95 * base_priority + 0.05 * result._structural_score).clip(0.0, 1.0)
 
-    result["evidence"] = result.apply(
-        lambda row: (
-            f"{row.evidence} | p:t={row._turnover_score:.2f},r={row._role_score:.2f},"
-            f"f={row._flow_score:.2f},pr={row._pagerank_score:.2f},"
-            f"sd={row._seed_depth_score:.2f},c={row._cluster_score:.2f},"
-            f"tm={row._temporal_score:.2f},g={row._structural_score:.2f} | "
-            f"tm:d={row.active_days},"
-            f"tx={row.tx_count_total},av={row.avg_tx_amount:.0f},"
-            f"fr={row.frequency_score:.2f},ti={row.transit_timing_score:.2f} | "
-            f"g={row.hub_score:.2f}/{row.authority_score:.2f}/{row.betweenness_score:.2f}"
-        ),
-        axis=1,
-    )
+    result["evidence"] = result.apply(human_evidence, axis=1)
     return result
 
 
