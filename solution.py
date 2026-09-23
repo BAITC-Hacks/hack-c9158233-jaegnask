@@ -133,6 +133,46 @@ def capped_log_score(values: pd.Series, quantile: float = 0.99) -> pd.Series:
     return np.log1p(values.clip(lower=0, upper=cap)) / np.log1p(cap)
 
 
+def temporal_features(transactions: pd.DataFrame, nodes: pd.DataFrame) -> pd.DataFrame:
+    """Считает активность и скорость дальнейшего перевода средств по датам."""
+    tx = transactions.reset_index(names="_tx_id").copy()
+    activity = pd.concat([
+        tx[["_tx_id", "src", "date", "sum_kzt"]].rename(columns={"src": "gid"}),
+        tx[["_tx_id", "dst", "date", "sum_kzt"]].rename(columns={"dst": "gid"}),
+    ], ignore_index=True).drop_duplicates(["_tx_id", "gid"])
+    summary = activity.groupby("gid").agg(
+        active_days=("date", "nunique"),
+        tx_count_total=("_tx_id", "size"),
+        avg_tx_amount=("sum_kzt", "mean"),
+    ).reset_index()
+
+    result = nodes[["gid", "is_seed"]].merge(summary, on="gid", how="left")
+    result[["active_days", "tx_count_total", "avg_tx_amount"]] = result[
+        ["active_days", "tx_count_total", "avg_tx_amount"]
+    ].fillna(0.0)
+    result["active_days"] = result.active_days.astype(int)
+    result["tx_count_total"] = result.tx_count_total.astype(int)
+    frequency = result.tx_count_total / result.active_days.replace(0, np.nan)
+    result["frequency_score"] = capped_log_score(frequency.fillna(0.0), quantile=0.95)
+
+    incoming_dates = tx.groupby("dst").date.apply(lambda dates: np.sort(dates.values))
+    outgoing_dates = tx.groupby("src").date.apply(lambda dates: np.sort(dates.values))
+    timing_by_gid = {}
+    for gid in set(incoming_dates.index) & set(outgoing_dates.index):
+        incoming = incoming_dates[gid]
+        outgoing = outgoing_dates[gid]
+        next_outgoing = np.searchsorted(outgoing, incoming, side="left")
+        valid = next_outgoing < len(outgoing)
+        if valid.any():
+            lag_days = (outgoing[next_outgoing[valid]] - incoming[valid]).astype("timedelta64[D]").astype(int)
+            timing_by_gid[gid] = max(0.0, 1.0 - float(lag_days.min()) / 7.0)
+
+    result["transit_timing_score"] = result.gid.map(timing_by_gid).fillna(0.0)
+    # Для seed входящие средства не полностью представлены в 4-hop выборке.
+    result.loc[result.is_seed, "transit_timing_score"] = 0.0
+    return result.drop(columns="is_seed")
+
+
 def role_thresholds(metrics: pd.DataFrame) -> dict[str, float]:
     """Пороги ролей из текущей выгрузки, а не вручную заданные константы."""
     outgoing = metrics.loc[metrics.out_deg > 0]
@@ -280,8 +320,9 @@ def cluster_statistics(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFram
 def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFrame:
     """Добавляет объяснимый приоритет для очереди AML-проверки.
 
-    priority_score = 30% оборот + 20% риск роли + 15% транзитность +
-                     15% PageRank + 10% близость к seed + 10% значимость кластера.
+    priority_score = 28% оборот + 19% риск роли + 14% транзитность +
+                     14% PageRank + 9% близость к seed + 9% значимость кластера +
+                     7% временная активность.
     """
     result = features.copy()
     turnover = result.in_kzt + result.out_kzt
@@ -324,22 +365,28 @@ def add_priority_scores(graph: nx.DiGraph, features: pd.DataFrame) -> pd.DataFra
         0.70 * capped_log_score(cluster_turnover)
         + 0.30 * capped_log_score(cluster_size)
     )
+    result["_temporal_score"] = (
+        0.60 * result.frequency_score + 0.40 * result.transit_timing_score
+    )
 
     result["priority_score"] = (
-        0.30 * result._turnover_score
-        + 0.20 * result._role_score
-        + 0.15 * result._flow_score
-        + 0.15 * result._pagerank_score
-        + 0.10 * result._seed_depth_score
-        + 0.10 * result._cluster_score
+        0.28 * result._turnover_score
+        + 0.19 * result._role_score
+        + 0.14 * result._flow_score
+        + 0.14 * result._pagerank_score
+        + 0.09 * result._seed_depth_score
+        + 0.09 * result._cluster_score
+        + 0.07 * result._temporal_score
     ).clip(0.0, 1.0)
 
     result["evidence"] = result.apply(
         lambda row: (
-            f"{row.evidence} | priority: turn={row._turnover_score:.2f}, "
-            f"role={row._role_score:.2f}, flow={row._flow_score:.2f}, "
-            f"pr={row._pagerank_score:.2f}, seed_depth={row._seed_depth_score:.2f}, "
-            f"cluster={row._cluster_score:.2f}"
+            f"{row.evidence} | p:t={row._turnover_score:.2f},r={row._role_score:.2f},"
+            f"f={row._flow_score:.2f},pr={row._pagerank_score:.2f},"
+            f"sd={row._seed_depth_score:.2f},c={row._cluster_score:.2f},"
+            f"time={row._temporal_score:.2f} | time:days={row.active_days},"
+            f"tx={row.tx_count_total},avg={row.avg_tx_amount:.0f},"
+            f"freq={row.frequency_score:.2f},timing={row.transit_timing_score:.2f}"
         ),
         axis=1,
     )
@@ -421,6 +468,7 @@ def main() -> None:
     graph = build_graph(edges)
     features = assign_roles(basic_metrics(graph, nodes))
     features = assign_clusters(graph, features)
+    features = features.merge(temporal_features(transactions, nodes), on="gid", how="left")
     features = add_priority_scores(graph, features)
     write_outputs(features, graph, args.out)
     print(f"Загружено: {len(nodes)} узлов, {len(edges)} рёбер, {len(transactions)} транзакций")
